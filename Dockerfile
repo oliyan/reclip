@@ -1,15 +1,27 @@
 FROM python:3.12-slim
 
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt gunicorn
 
 COPY . .
 
+RUN useradd -m -u 1000 reclip && \
+    mkdir -p /app/downloads && \
+    chown -R reclip:reclip /app
+USER reclip
+
 EXPOSE 8899
-ENV HOST=0.0.0.0
-CMD ["python", "app.py"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+    CMD curl -fsS http://localhost:8899/ || exit 1
+
+CMD ["gunicorn", "-b", "0.0.0.0:8899", "-w", "2", "--timeout", "600", "app:app"]
