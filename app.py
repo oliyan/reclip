@@ -13,6 +13,22 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 jobs = {}
 
 
+def parse_ytdlp_json(stdout):
+    """Parse yt-dlp JSON output.
+
+    With ``-j`` yt-dlp prints one JSON object per line. Some extractors
+    emit multiple videos even with ``--no-playlist``, so stdout contains
+    several objects and a plain ``json.loads`` raises "Extra data".
+    Return the first valid object.
+    """
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        return json.loads(line)
+    raise ValueError("yt-dlp returned no data")
+
+
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
@@ -91,7 +107,7 @@ def get_info():
         if result.returncode != 0:
             return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
 
-        info = json.loads(result.stdout)
+        info = parse_ytdlp_json(result.stdout)
 
         # Build quality options — keep best format per resolution
         best_by_height = {}
