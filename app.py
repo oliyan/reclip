@@ -1,210 +1,171 @@
 import os
-import uuid
-import glob
 import json
-import subprocess
-import threading
-from flask import Flask, request, jsonify, send_file, render_template
+import logging
+from flask import Flask, request, jsonify, render_template
+import yt_dlp
 
 app = Flask(__name__)
-DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-jobs = {}
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Default directory if the user leaves the text input blank
+DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'downloads')
 
-def parse_ytdlp_json(stdout):
-    """Parse yt-dlp JSON output.
+def resolve_download_dir(user_path=None):
+    """Returns user path if valid, otherwise creates and returns default."""
+    if user_path and str(user_path).strip():
+        # Expand '~' to the user's home directory path
+        path = os.path.expanduser(str(user_path).strip())
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except Exception as e:
+            logging.error(f"Could not create custom directory {path}: {e}")
+            pass
+            
+    os.makedirs(DEFAULT_DOWNLOAD_DIR, exist_ok=True)
+    return DEFAULT_DOWNLOAD_DIR
 
-    With ``-j`` yt-dlp prints one JSON object per line. Some extractors
-    emit multiple videos even with ``--no-playlist``, so stdout contains
-    several objects and a plain ``json.loads`` raises "Extra data".
-    Return the first valid object.
-    """
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        return json.loads(line)
-    raise ValueError("yt-dlp returned no data")
-
-
-def run_download(job_id, url, format_choice, format_id):
-    job = jobs[job_id]
-    out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
-
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
-
-    if format_choice == "audio":
-        cmd += ["-x", "--audio-format", "mp3"]
-    elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
-    else:
-        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
-
-    cmd.append(url)
-
+def update_ytdlp(ydl_opts):
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            job["status"] = "error"
-            job["error"] = result.stderr.strip().split("\n")[-1]
-            return
-
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
-        if not files:
-            job["status"] = "error"
-            job["error"] = "Download completed but no file was found"
-            return
-
-        if format_choice == "audio":
-            target = [f for f in files if f.endswith(".mp3")]
-            chosen = target[0] if target else files[0]
-        else:
-            target = [f for f in files if f.endswith(".mp4")]
-            chosen = target[0] if target else files[0]
-
-        for f in files:
-            if f != chosen:
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-
-        job["status"] = "done"
-        job["file"] = chosen
-        ext = os.path.splitext(chosen)[1]
-        title = job.get("title", "").strip()
-        # Sanitize title for filename
-        if title:
-            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:100].strip()
-            job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
-        else:
-            job["filename"] = os.path.basename(chosen)
-    except subprocess.TimeoutExpired:
-        job["status"] = "error"
-        job["error"] = "Download timed out (5 min limit)"
+        import sys
+        import subprocess
+        logging.info("Attempting to update yt-dlp...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"])
+        logging.info("yt-dlp update check complete.")
     except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
+        logging.error(f"Failed to update yt-dlp: {e}")
 
-
-@app.route("/")
+@app.route('/')
 def index():
-    return render_template("index.html")
+    return render_template('index.html')
 
-
-@app.route("/api/info", methods=["POST"])
+@app.route('/info', methods=['POST'])
 def get_info():
     data = request.json
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
+    urls = data.get('urls', [])
+    
+    if not urls:
+         return jsonify({'error': 'No URLs provided'}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
+    results = []
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True,
+        'skip_download': True
+    }
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            for url in urls:
+                try:
+                    # Detect YouTube playlists explicitly to handle 'list=' parameter correctly
+                    if 'youtube.com' in url and 'list=' in url:
+                        # For YouTube playlists, yt-dlp treats the whole playlist as one entry if extract_flat=True
+                        info = ydl.extract_info(url, download=False)
+                        if 'entries' in info:
+                            # It's a playlist, return multiple entries
+                            for entry in info['entries']:
+                                results.append({
+                                    'title': entry.get('title', 'Unknown Title'),
+                                    'url': entry.get('url', url),
+                                    'thumbnail': entry.get('thumbnail', None),
+                                    'duration': entry.get('duration', None),
+                                    'id': entry.get('id', None),
+                                    'webpage_url': entry.get('url', url) # fallback
+                                })
+                        else:
+                            # Not a playlist or fallback needed
+                            results.append({
+                                'title': info.get('title', 'Unknown Title'),
+                                'url': url,
+                                'thumbnail': info.get('thumbnail', None),
+                                'duration': info.get('duration', None),
+                                'id': info.get('id', None),
+                                'webpage_url': url
+                            })
+                    else:
+                        # Standard single video fetch
+                        info = ydl.extract_info(url, download=False)
+                        results.append({
+                            'title': info.get('title', 'Unknown Title'),
+                            'url': url,
+                            'thumbnail': info.get('thumbnail', None),
+                            'duration': info.get('duration', None),
+                            'id': info.get('id', None),
+                            'webpage_url': url
+                        })
+                except Exception as e:
+                    logging.error(f"Error fetching info for {url}: {e}")
+                    results.append({
+                        'title': 'Error fetching info',
+                        'url': url,
+                        'error': str(e)
+                    })
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-        info = parse_ytdlp_json(result.stdout)
+@app.route('/download', methods=['POST'])
+def download():
+    data = request.json
+    url = data.get('url')
+    format_type = data.get('format', 'mp4')
+    resolution = data.get('resolution', 'best')
+    custom_path = data.get('download_path', '')
+    
+    if not url:
+        return jsonify({'error': 'URL is required'}), 400
 
-        # Build quality options — keep best format per resolution
-        best_by_height = {}
-        for f in info.get("formats", []):
-            height = f.get("height")
-            if height and f.get("vcodec", "none") != "none":
-                tbr = f.get("tbr") or 0
-                if height not in best_by_height or tbr > (best_by_height[height].get("tbr") or 0):
-                    best_by_height[height] = f
+    download_dir = resolve_download_dir(custom_path)
+    output_template = os.path.join(download_dir, '%(title)s.%(ext)s')
 
-        formats = []
-        for height, f in best_by_height.items():
-            formats.append({
-                "id": f["format_id"],
-                "label": f"{height}p",
-                "height": height,
-            })
-        formats.sort(key=lambda x: x["height"], reverse=True)
+    ydl_opts = {
+        'outtmpl': output_template,
+        'quiet': True,
+        'no_warnings': True,
+    }
 
-        return jsonify({
-            "title": info.get("title", ""),
-            "thumbnail": info.get("thumbnail", ""),
-            "duration": info.get("duration"),
-            "uploader": info.get("uploader", ""),
-            "formats": formats,
+    if format_type == 'mp3':
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
         })
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching video info"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    else: # mp4
+        if resolution == 'best':
+            ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        else:
+            ydl_opts['format'] = f'bestvideo[height<={resolution}][ext=mp4]+bestaudio[ext=m4a]/best[height<={resolution}][ext=mp4]/best'
+            
+        # Ensure final output is mp4 if possible using ffmpeg
+        ydl_opts['merge_output_format'] = 'mp4'
 
-
-@app.route("/api/playlist", methods=["POST"])
-def get_playlist_info():
-    data = request.json
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    cmd = ["yt-dlp", "--flat-playlist", "-J", url]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
-
-        info = json.loads(result.stdout)
-        entries = info.get("entries", [])
-        urls = [entry.get("url") for entry in entries if entry.get("url")]
-        return jsonify({"urls": urls})
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching playlist info"}), 400
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return jsonify({'success': True, 'message': f'Downloaded to {download_dir}'})
+    except yt_dlp.utils.DownloadError as e:
+        logging.error(f"yt-dlp Download Error: {str(e)}")
+        # Optional auto-update if error indicates unsupported URL/extractor issue
+        if "Unsupported URL" in str(e) or "ExtractorError" in str(e):
+             logging.info("Attempting auto-update of yt-dlp due to error...")
+             update_ytdlp(ydl_opts)
+             # Note: You generally wouldn't retry the download here automatically 
+             # because the process needs to restart to pick up the new yt-dlp package.
+             return jsonify({'error': f'Download failed. Auto-updated yt-dlp in background. Please restart the app and try again. Error: {str(e)}'}), 500
+        return jsonify({'error': str(e)}), 500
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        logging.error(f"General Download Error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
-
-@app.route("/api/download", methods=["POST"])
-def start_download():
-    data = request.json
-    url = data.get("url", "").strip()
-    format_choice = data.get("format", "video")
-    format_id = data.get("format_id")
-    title = data.get("title", "")
-
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
-
-    thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
-    thread.daemon = True
-    thread.start()
-
-    return jsonify({"job_id": job_id})
-
-
-@app.route("/api/status/<job_id>")
-def check_status(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
-    return jsonify({
-        "status": job["status"],
-        "error": job.get("error"),
-        "filename": job.get("filename"),
-    })
-
-
-@app.route("/api/file/<job_id>")
-def download_file(job_id):
-    job = jobs.get(job_id)
-    if not job or job["status"] != "done":
-        return jsonify({"error": "File not ready"}), 404
-    return send_file(job["file"], as_attachment=True, download_name=job["filename"])
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8899))
-    host = os.environ.get("HOST", "127.0.0.1")
-    app.run(host=host, port=port)
+if __name__ == '__main__':
+    # Initial auto-update check on boot (optional, can be disabled if too slow)
+    update_ytdlp(None)
+    app.run(host='0.0.0.0', port=8899, debug=True)
